@@ -124,13 +124,7 @@ class LoadWebcam:  # for inference
         pipe = 0  # local camera
         # pipe = 'rtsp://192.168.1.64/1'  # IP camera
         # pipe = 'rtsp://username:password@192.168.1.64/1'  # IP camera with login
-
-        # https://answers.opencv.org/question/215996/changing-gstreamer-pipeline-to-opencv-in-pythonsolved/
-        # pipe = '"rtspsrc location="rtsp://username:password@192.168.1.64/1" latency=10 ! appsink'  # GStreamer
-
-        # https://answers.opencv.org/question/200787/video-acceleration-gstremer-pipeline-in-videocapture/
-        # https://stackoverflow.com/questions/54095699/install-gstreamer-support-for-opencv-python-package  # install help
-        # pipe = "rtspsrc location=rtsp://root:root@192.168.0.91:554/axis-media/media.amp?videocodec=h264&resolution=3840x2160 protocols=GST_RTSP_LOWER_TRANS_TCP ! rtph264depay ! queue ! vaapih264dec ! videoconvert ! appsink"  # GStreamer
+        # pipe = '"rtspsrc location="rtsp://username:password@192.168.1.64/1" latency=10 ! appsink'  # GStreamer https://answers.opencv.org/question/215996/changing-gstreamer-pipeline-to-opencv-in-pythonsolved/
 
         self.cap = cv2.VideoCapture(pipe)  # video capture object
 
@@ -169,9 +163,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=True, image_weights=False,
                  cache_images=False):
         path = str(Path(path))  # os-agnostic
+        print(path)
         with open(path, 'r') as f:
             self.img_files = [x.replace('/', os.sep) for x in f.read().splitlines()  # os-agnostic
                               if os.path.splitext(x)[-1].lower() in img_formats]
+            print([x.replace('/', os.sep) for x in f.read().splitlines()  # os-agnostic
+                              if os.path.splitext(x)[-1].lower() in img_formats])
 
         n = len(self.img_files)
         bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
@@ -208,7 +205,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             i = ar.argsort()
             self.img_files = [self.img_files[i] for i in i]
             self.label_files = [self.label_files[i] for i in i]
-            self.shapes = s[i]
             ar = ar[i]
 
             # Set training image shapes
@@ -249,6 +245,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     # Extract object detection boxes for a second stage classifier
                     if extract_bounding_boxes:
                         p = Path(self.img_files[i])
+                        print(p)
                         img = cv2.imread(str(p))
                         h, w, _ = img.shape
                         for j, x in enumerate(l):

@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from tqdm import tqdm
 
 from . import torch_utils  # , google_utils
@@ -56,19 +57,13 @@ def model_info(model, report='summary'):
 
 def labels_to_class_weights(labels, nc=80):
     # Get class weights (inverse frequency) from training labels
-    ni = len(labels)  # number of images
     labels = np.concatenate(labels, 0)  # labels.shape = (866643, 5) for COCO
     classes = labels[:, 0].astype(np.int)  # labels = [class xywh]
     weights = np.bincount(classes, minlength=nc)  # occurences per class
-
-    # Prepend gridpoint count (for uCE trianing)
-    # gpi = ((320 / 32 * np.array([1, 2, 4])) ** 2 * 3).sum()  # gridpoints per image
-    # weights = np.hstack([gpi * ni - weights.sum() * 9, weights * 9]) ** 0.5  # prepend gridpoints to start
-
     weights[weights == 0] = 1  # replace empty bins with 1
     weights = 1 / weights  # number of targets per class
     weights /= weights.sum()  # normalize
-    return torch.from_numpy(weights)
+    return torch.Tensor(weights)
 
 
 def labels_to_image_weights(labels, nc=80, class_weights=np.ones(80)):
@@ -288,105 +283,63 @@ def wh_iou(box1, box2):
     return inter_area / union_area  # iou
 
 
-class FocalLoss(nn.Module):
-    # Wraps focal loss around existing loss_fcn() https://arxiv.org/pdf/1708.02002.pdf
-    # i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=2.5)
-    def __init__(self, loss_fcn, alpha=1, gamma=2, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        loss_fcn.reduction = 'none'  # required to apply FL to each element
-        self.loss_fcn = loss_fcn
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, input, target):
-        loss = self.loss_fcn(input, target)
-        pt = torch.exp(-loss)
-        loss *= self.alpha * (1 - pt) ** self.gamma
-
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:  # 'none'
-            return loss
-
-
-def compute_loss(p, targets, model):  # predictions, targets, model
+def compute_loss(p, targets, model, giou_loss=True):  # predictions, targets, model
     ft = torch.cuda.FloatTensor if p[0].is_cuda else torch.Tensor
-    lcls, lbox, lobj = ft([0]), ft([0]), ft([0])
-    tcls, tbox, indices, anchor_vec = build_targets(model, targets)
+    lxy, lwh, lcls, lobj = ft([0]), ft([0]), ft([0]), ft([0])
+    txy, twh, tcls, tbox, indices, anchor_vec = build_targets(model, targets)
     h = model.hyp  # hyperparameters
 
     # Define criteria
+    MSE = nn.MSELoss()
     BCEcls = nn.BCEWithLogitsLoss(pos_weight=ft([h['cls_pw']]))
     BCEobj = nn.BCEWithLogitsLoss(pos_weight=ft([h['obj_pw']]))
-    # CE = nn.CrossEntropyLoss(weight=model.class_weights)
+    # CE = nn.CrossEntropyLoss()  # (weight=model.class_weights)
 
     # Compute losses
     bs = p[0].shape[0]  # batch size
     k = bs / 64  # loss gain
-    arc = 'normal'  # (normal, uCE, uBCE, uBCEs) detection architectures
-    for i, pi in enumerate(p):  # layer index, layer predictions
+    for i, pi0 in enumerate(p):  # layer i predictions, i
         b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
-        tobj = torch.zeros_like(pi[..., 0])  # target obj
+        tobj = torch.zeros_like(pi0[..., 0])  # target obj
 
         # Compute losses
         nb = len(b)
         if nb:  # number of targets
-            ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
+            pi = pi0[b, a, gj, gi]  # predictions closest to anchors
             tobj[b, a, gj, gi] = 1.0  # obj
-            # ps[:, 2:4] = torch.sigmoid(ps[:, 2:4])  # wh power loss (uncomment)
+            # pi[..., 2:4] = torch.sigmoid(pi[..., 2:4])  # wh power loss (uncomment)
 
-            # GIoU
-            pxy = torch.sigmoid(ps[:, 0:2])  # pxy = pxy * s - (s - 1) / 2,  s = 1.5  (scale_xy)
-            pbox = torch.cat((pxy, torch.exp(ps[:, 2:4]) * anchor_vec[i]), 1)  # predicted box
-            giou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, GIoU=True)  # giou computation
-            lbox += (1.0 - giou).mean()  # giou loss
+            # s = 1.5  # scale_xy
+            pxy = torch.sigmoid(pi[..., 0:2])  # * s - (s - 1) / 2
+            if giou_loss:
+                pbox = torch.cat((pxy, torch.exp(pi[..., 2:4]) * anchor_vec[i]), 1)  # predicted
+                giou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, GIoU=True)  # giou computation
+                lxy += (k * h['giou']) * (1.0 - giou).mean()  # giou loss
+            else:
+                lxy += (k * h['xy']) * MSE(pxy, txy[i])  # xy loss
+                lwh += (k * h['wh']) * MSE(pi[..., 2:4], twh[i])  # wh yolo loss
 
-            if arc == 'normal' and model.nc > 1:  # cls loss (only if multiple classes)
-                t = torch.zeros_like(ps[:, 5:])  # targets
-                t[range(nb), tcls[i]] = 1.0
-                lcls += BCEcls(ps[:, 5:], t)  # BCE
-                # lcls += CE(ps[:, 5:], tcls[i])  # CE
+            if model.nc > 1:  # cls loss (only if multiple classes)
+                tclsm = torch.zeros_like(pi[..., 5:])
+                tclsm[range(nb), tcls[i]] = 1.0
+                lcls += (k * h['cls']) * BCEcls(pi[..., 5:], tclsm)  # BCE
+                # lcls += (k * h['cls']) * CE(pi[..., 5:], tcls[i])  # CE
 
             # Append targets to text file
             # with open('targets.txt', 'a') as file:
             #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
 
-        if arc == 'normal':
-            lobj += BCEobj(pi[..., 4], tobj)  # obj loss
+        lobj += (k * h['obj']) * BCEobj(pi0[..., 4], tobj)  # obj loss
+    loss = lxy + lwh + lobj + lcls
 
-        elif arc == 'uCE':  # unified CE (1 background + 80 classes), hyps 20
-            t = torch.zeros_like(pi[..., 0], dtype=torch.long)  # targets
-            if nb:
-                t[b, a, gj, gi] = tcls[i] + 1
-            lcls += CE(pi[..., 4:].view(-1, model.nc + 1), t.view(-1))
-
-        elif arc == 'uBCE':  # unified BCE (1 background + 80 classes), hyps 200-30
-            t = torch.zeros_like(pi[..., 5:])  # targets
-            if nb:
-                t[b, a, gj, gi, tcls[i]] = 1.0
-            lcls += BCEcls(pi[..., 5:], t)
-
-        elif arc == 'uBCEs':  # unified BCE simplified (80 classes)
-            t = torch.zeros_like(pi[..., 5:])  # targets
-            if nb:
-                t[b, a, gj, gi, tcls[i]] = 1.0
-            lcls += BCEcls(pi[..., 5:], t)
-
-    lbox *= k * h['giou']
-    lobj *= k * h['obj']
-    lcls *= k * h['cls']
-    loss = lbox + lobj + lcls
-    return loss, torch.cat((lbox, ft([0]), lobj, lcls, loss)).detach()
+    return loss, torch.cat((lxy, lwh, lobj, lcls, loss)).detach()
 
 
 def build_targets(model, targets):
     # targets = [image, class, x, y, w, h]
 
     nt = len(targets)
-    tcls, tbox, indices, av = [], [], [], []
+    txy, twh, tcls, tbox, indices, av = [], [], [], [], [], []
     multi_gpu = type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
     for i in model.yolo_layers:
         # get number of grid points and anchor vec for this yolo layer
@@ -423,17 +376,24 @@ def build_targets(model, targets):
         gi, gj = gxy.long().t()  # grid x, y indices
         indices.append((b, a, gj, gi))
 
+        # XY coordinates
+        gxy -= gxy.floor()
+        txy.append(gxy)
+
         # GIoU
-        gxy -= gxy.floor()  # xy
         tbox.append(torch.cat((gxy, gwh), 1))  # xywh (grids)
         av.append(anchor_vec[a])  # anchor vec
+
+        # Width and height
+        twh.append(torch.log(gwh / anchor_vec[a]))  # wh yolo method
+        # twh.append((gwh / anchor_vec[a]) ** (1 / 3) / 2)  # wh power method
 
         # Class
         tcls.append(c)
         if c.shape[0]:  # if any targets
             assert c.max() <= model.nc, 'Target classes exceed model classes'
 
-    return tcls, tbox, indices, av
+    return txy, twh, tcls, tbox, indices, av
 
 
 def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.5):
@@ -615,37 +575,44 @@ def coco_single_class_labels(path='../coco/labels/train2014/', label_class=43):
             shutil.copyfile(src=img_file, dst='new/images/' + Path(file).name.replace('txt', 'jpg'))  # copy images
 
 
-def kmeans_targets(path='../coco/trainvalno5k.txt', n=9, img_size=416):  # from utils.utils import *; kmeans_targets()
+def kmeans_targets(path='./data/coco_64img.txt', n=9, img_size=320):  # from utils.utils import *; kmeans_targets()
     # Produces a list of target kmeans suitable for use in *.cfg files
-    from utils.datasets import LoadImagesAndLabels
+    img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif']
+    with open(path, 'r') as f:
+        img_files = [x for x in f.read().splitlines() if os.path.splitext(x)[-1].lower() in img_formats]
+
+    # Read shapes
+    nf = len(img_files)
+    assert nf > 0, 'No images found in %s' % path
+    label_files = [x.replace('images', 'labels').replace(os.path.splitext(x)[-1], '.txt') for x in img_files]
+    s = np.array([Image.open(f).size for f in tqdm(img_files, desc='Reading image shapes')])  # (width, height)
+
+    # Read targets
+    labels = [np.zeros((0, 5))] * nf
+    iter = tqdm(label_files, desc='Reading labels')
+    for i, file in enumerate(iter):
+        try:
+            with open(file, 'r') as f:
+                l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)
+                if l.shape[0]:
+                    assert l.shape[1] == 5, '> 5 label columns: %s' % file
+                    assert (l >= 0).all(), 'negative labels: %s' % file
+                    assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                    l[:, [1, 3]] *= s[i][0]
+                    l[:, [2, 4]] *= s[i][1]
+                    l[:, 1:] *= img_size / max(s[i])  # nominal img_size for training here
+                    labels[i] = l
+        except:
+            pass  # print('Warning: missing labels for %s' % self.img_files[i])  # missing label file
+    assert len(np.concatenate(labels, 0)) > 0, 'No labels found. Incorrect label paths provided.'
+
+    # kmeans calculation
     from scipy import cluster
-
-    # Get label wh
-    dataset = LoadImagesAndLabels(path, augment=True, rect=True)
-    for s, l in zip(dataset.shapes, dataset.labels):
-        l[:, [1, 3]] *= s[0]  # normalized to pixels
-        l[:, [2, 4]] *= s[1]
-        l[:, 1:] *= img_size / max(s)  # nominal img_size for training
-    wh = np.concatenate(dataset.labels, 0)[:, 3:5]  # wh from cxywh
-
-    # Kmeans calculation
+    wh = np.concatenate(labels, 0)[:, 3:5]
     k = cluster.vq.kmeans(wh, n)[0]
-    k = k[np.argsort(k.prod(1))]  # sort small to large
-
-    # Measure IoUs
-    iou = torch.stack([wh_iou(torch.Tensor(wh).T, torch.Tensor(x).T) for x in k], 0)
-    biou = iou.max(0)[0]  # closest anchor IoU
-
-    print((biou < 0.2635).float().mean())
-
-    # Print
-    print('kmeans anchors (n=%g, img_size=%g, IoU=%.2f/%.2f/%.2f-min/mean/best): ' %
-          (n, img_size, biou.min(), iou.mean(), biou.mean()), end='')
-    for i, x in enumerate(k):
-        print('%i,%i' % (round(x[0]), round(x[1])), end=',  ' if i < len(k) - 1 else '\n')  # use in *.cfg
-
-    # Plot
-    # plt.hist(biou.numpy().ravel(), 100)
+    k = k[np.argsort(k.prod(1))]
+    for x in k.ravel():
+        print('%.1f, ' % x, end='')  # drop-in replacement for *.cfg anchors
 
 
 def print_mutation(hyp, results, bucket=''):
@@ -657,14 +624,14 @@ def print_mutation(hyp, results, bucket=''):
 
     if bucket:
         os.system('gsutil cp gs://%s/evolve.txt .' % bucket)  # download evolve.txt
-
-    with open('evolve.txt', 'a') as f:  # append result
-        f.write(c + b + '\n')
-    x = np.unique(np.loadtxt('evolve.txt', ndmin=2), axis=0)  # load unique rows
-    np.savetxt('evolve.txt', x[np.argsort(-fitness(x))], '%11.3g')  # save sort by fitness
-
-    if bucket:
+        with open('evolve.txt', 'a') as f:  # append result
+            f.write(c + b + '\n')
+        x = np.unique(np.loadtxt('evolve.txt', ndmin=2), axis=0)  # load unique rows
+        np.savetxt('evolve.txt', x[np.argsort(-fitness(x))], '%11.3g')  # save sort by fitness
         os.system('gsutil cp evolve.txt gs://%s' % bucket)  # upload evolve.txt
+    else:
+        with open('evolve.txt', 'a') as f:
+            f.write(c + b + '\n')
 
 
 def fitness(x):

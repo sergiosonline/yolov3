@@ -1,22 +1,22 @@
-import torch.nn.functional as F
-
 from utils.parse_config import *
 from utils.utils import *
+from pathlib import Path
+
+import torch.nn.functional as F
 
 ONNX_EXPORT = False
 
 
-def create_modules(module_defs, img_size):
+def create_modules(module_defs):
     """
     Constructs module list of layer blocks from module configuration in module_defs
     """
     hyperparams = module_defs.pop(0)
     output_filters = [int(hyperparams['channels'])]
     module_list = nn.ModuleList()
-    routs = []  # list of layers which rout to deeper layes
     yolo_index = -1
 
-    for i, mdef in enumerate(module_defs):
+    for mdef in module_defs:
         modules = nn.Sequential()
 
         if mdef['type'] == 'convolutional':
@@ -53,14 +53,11 @@ def create_modules(module_defs, img_size):
         elif mdef['type'] == 'route':  # nn.Sequential() placeholder for 'route' layer
             layers = [int(x) for x in mdef['layers'].split(',')]
             filters = sum([output_filters[i + 1 if i > 0 else i] for i in layers])
-            routs.extend([l if l > 0 else l + i for l in layers])
             # if mdef[i+1]['type'] == 'reorg3d':
             #     modules = nn.Upsample(scale_factor=1/float(mdef[i+1]['stride']), mode='nearest')  # reorg3d
 
         elif mdef['type'] == 'shortcut':  # nn.Sequential() placeholder for 'shortcut' layer
             filters = output_filters[int(mdef['from'])]
-            layer = int(mdef['from'])
-            routs.extend([i + layer if layer < 0 else layer])
 
         elif mdef['type'] == 'reorg3d':  # yolov3-spp-pan-scale
             # torch.Size([16, 128, 104, 104])
@@ -70,9 +67,11 @@ def create_modules(module_defs, img_size):
         elif mdef['type'] == 'yolo':
             yolo_index += 1
             mask = [int(x) for x in mdef['mask'].split(',')]  # anchor mask
-            modules = YOLOLayer(anchors=mdef['anchors'][mask],  # anchor list
+            a = [float(x) for x in mdef['anchors'].split(',')]  # anchors
+            a = [(a[i], a[i + 1]) for i in range(0, len(a), 2)]
+            modules = YOLOLayer(anchors=[a[i] for i in mask],  # anchor list
                                 nc=int(mdef['classes']),  # number of classes
-                                img_size=img_size,  # (416, 416)
+                                img_size=hyperparams['height'],  # 416
                                 yolo_index=yolo_index)  # 0, 1 or 2
         else:
             print('Warning: Unrecognized Layer Type: ' + mdef['type'])
@@ -81,7 +80,7 @@ def create_modules(module_defs, img_size):
         module_list.append(modules)
         output_filters.append(filters)
 
-    return module_list, routs
+    return hyperparams, module_list
 
 
 class Swish(nn.Module):
@@ -155,18 +154,8 @@ class YOLOLayer(nn.Module):
             # io[..., 2:4] = ((torch.sigmoid(io[..., 2:4]) * 2) ** 3) * self.anchor_wh  # wh power method
             io[..., :4] *= self.stride
 
-            arc = 'uBCEs'  # (normal, uCE, uBCE, uBCEs) detection architectures
-            if arc == 'normal':
-                torch.sigmoid_(io[..., 4:])
-            elif arc == 'uCE':  # unified CE (1 background + 80 classes)
-                io[..., 4:] = F.softmax(io[..., 4:], dim=4)
-                io[..., 4] = 1
-            elif arc == 'uBCE':  # unified BCE (1 background + 80 classes)
-                torch.sigmoid_(io[..., 4:])
-                io[..., 4] = 1 - io[..., 4]
-            elif arc == 'uBCEs':  # unified BCE simplified (80 classes)
-                torch.sigmoid_(io[..., 5:])
-                io[..., 4] = 1
+            io[..., 4:] = torch.sigmoid(io[..., 4:])  # p_conf, p_cls
+            # io[..., 5:] = F.softmax(io[..., 5:], dim=4)  # p_cls
 
             if self.nc == 1:
                 io[..., 5] = 1  # single-class model https://github.com/ultralytics/yolov3/issues/235
@@ -182,7 +171,9 @@ class Darknet(nn.Module):
         super(Darknet, self).__init__()
 
         self.module_defs = parse_model_cfg(cfg)
-        self.module_list, self.routs = create_modules(self.module_defs, img_size)
+        self.module_defs[0]['cfg'] = cfg
+        self.module_defs[0]['height'] = img_size
+        self.hyperparams, self.module_list = create_modules(self.module_defs)
         self.yolo_layers = get_yolo_layers(self)
 
         # Darknet Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
@@ -199,22 +190,23 @@ class Darknet(nn.Module):
             if mtype in ['convolutional', 'upsample', 'maxpool']:
                 x = module(x)
             elif mtype == 'route':
-                layers = [int(x) for x in mdef['layers'].split(',')]
-                if len(layers) == 1:
-                    x = layer_outputs[layers[0]]
+                layer_i = [int(x) for x in mdef['layers'].split(',')]
+                if len(layer_i) == 1:
+                    x = layer_outputs[layer_i[0]]
                 else:
                     try:
-                        x = torch.cat([layer_outputs[i] for i in layers], 1)
+                        x = torch.cat([layer_outputs[i] for i in layer_i], 1)
                     except:  # apply stride 2 for darknet reorg layer
-                        layer_outputs[layers[1]] = F.interpolate(layer_outputs[layers[1]], scale_factor=[0.5, 0.5])
-                        x = torch.cat([layer_outputs[i] for i in layers], 1)
-                    # print(''), [print(layer_outputs[i].shape) for i in layers], print(x.shape)
+                        layer_outputs[layer_i[1]] = F.interpolate(layer_outputs[layer_i[1]], scale_factor=[0.5, 0.5])
+                        x = torch.cat([layer_outputs[i] for i in layer_i], 1)
+                    # print(''), [print(layer_outputs[i].shape) for i in layer_i], print(x.shape)
             elif mtype == 'shortcut':
-                x = x + layer_outputs[int(mdef['from'])]
+                layer_i = int(mdef['from'])
+                x = layer_outputs[-1] + layer_outputs[layer_i]
             elif mtype == 'yolo':
                 x = module(x, img_size)
                 output.append(x)
-            layer_outputs.append(x if i in self.routs else [])
+            layer_outputs.append(x)
 
         if self.training:
             return output

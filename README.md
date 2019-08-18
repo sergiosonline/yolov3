@@ -52,7 +52,7 @@ Our Jupyter [notebook](https://colab.research.google.com/github/ultralytics/yolo
 **Resume Training:** `python3 train.py --resume` to resume training from `weights/last.pt`.
 
 **Plot Training:** `from utils import utils; utils.plot_results()` plots training results from `coco_16img.data`, `coco_64img.data`, 2 example datasets available in the `data/` folder, which train and test on the first 16 and 64 images of the COCO2014-trainval dataset.
-![image](https://user-images.githubusercontent.com/26833433/62865295-5ed94580-bd0e-11e9-9803-e07571e2ea23.png)
+![results](https://user-images.githubusercontent.com/26833433/62325526-1fa82a80-b4ac-11e9-958e-2a263bf15ab0.png)
 
 ## Image Augmentation
 
@@ -132,13 +132,33 @@ Success: converted 'weights/yolov3-spp.pt' to 'converted.weights'
 - `test.py --weights weights/best.pt` tests best checkpoint.
 - Compare to darknet published results https://arxiv.org/abs/1804.02767.
 
-[ultralytics/yolov3](https://github.com/ultralytics/yolov3) mAP@0.5 ([darknet](https://arxiv.org/abs/1804.02767)-reported mAP@0.5)
+<!---
+%<i></i> | ultralytics/yolov3 OR-NMS 5:52@416 (`pycocotools`) | darknet  
+--- | --- | ---  
+YOLOv3-320 | 51.9 (51.4) | 51.5  
+YOLOv3-416 | 55.0 (54.9) | 55.3  
+YOLOv3-608 | 57.5 (57.8) | 57.9  
 
-<i></i>         | 320         | 416         | 608
----             | ---         | ---         | ---
-`YOLOv3`        | 51.8 (51.5) | 55.4 (55.3) | 58.2 (57.9)
-`YOLOv3-SPP`    | 52.4        | 56.5        | 60.7 (60.6)
-`YOLOv3-tiny`   | 29.0        | 32.9 (33.1) | 35.5
+<i></i> | ultralytics/yolov3 MERGE-NMS 7:15@416 (`pycocotools`) | darknet  
+--- | --- | ---  
+YOLOv3-320 | 52.3 (51.7) | 51.5  
+YOLOv3-416 | 55.4 (55.3) | 55.3  
+YOLOv3-608 | 57.9 (58.1) | 57.9  
+
+<i></i> | ultralytics/yolov3 MERGE+earlier_pred4 8:34@416 (`pycocotools`) | darknet  
+--- | --- | ---  
+YOLOv3-320 | 52.3 (51.8) | 51.5  
+YOLOv3-416 | 55.5 (55.4) | 55.3  
+YOLOv3-608 | 57.9 (58.2) | 57.9  
+--->
+<i></i> | [ultralytics/yolov3](https://github.com/ultralytics/yolov3) | [darknet](https://arxiv.org/abs/1804.02767) 
+--- | --- | ---  
+`YOLOv3 320` | 51.8 | 51.5  
+`YOLOv3 416` | 55.4 | 55.3  
+`YOLOv3 608` | 58.2 | 57.9  
+`YOLOv3-spp 320` | 52.4 | -  
+`YOLOv3-spp 416` | 56.5 | -  
+`YOLOv3-spp 608` | 60.7 | 60.6  
 
 ``` bash
 # install pycocotools
@@ -150,8 +170,8 @@ Namespace(batch_size=16, cfg='cfg/yolov3-spp.cfg', conf_thres=0.001, data='data/
 Using CUDA device0 _CudaDeviceProperties(name='Tesla T4', total_memory=15079MB)
                 Class    Images   Targets         P         R       mAP        F1: 100% 313/313 [07:40<00:00,  2.34s/it]
                 all       5e+03  3.58e+04     0.117     0.788     0.595     0.199
- Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.367 <---
- Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.607 <---
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.367
+ Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.607 <--
  Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.387
  Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.208
  Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.392
@@ -168,8 +188,8 @@ Namespace(batch_size=16, cfg='cfg/yolov3-spp.cfg', conf_thres=0.001, data='data/
 Using CUDA device0 _CudaDeviceProperties(name='Tesla T4', total_memory=15079MB)
                 Class    Images   Targets         P         R       mAP        F1: 100% 313/313 [07:01<00:00,  1.41s/it]
                 all       5e+03  3.58e+04     0.105     0.746     0.554      0.18
- Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.336 <---
- Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.565 <---
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.336
+ Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.565 <--
  Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.350
  Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.151
  Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.361

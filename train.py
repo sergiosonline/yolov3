@@ -33,11 +33,11 @@ except:
 # 0.268	0.268	0.178	0.240	4.36	1.104	5.596	0.2087	14.47	2.599	16.27	2.406	0.4114	0.001585	-4	0.950	0.000524  # hc
 # 0.161	0.327	0.190	0.193	7.82	1.153	4.062	0.1845	24.28	3.05	20.93	2.842	0.2759	0.001357	-4	0.916	0.000572  # hd 0.438 mAP @ epoch 100
 
-# Hyperparameters (j-series, 50.5 mAP yolov3-320) evolved by @ktian08 https://github.com/ultralytics/yolov3/issues/310
+# Training hyperparameters j (50.5 mAP yolov3-320) evolved by @ktian08 https://github.com/ultralytics/yolov3/issues/310
 hyp = {'giou': 1.582,  # giou loss gain
        'xy': 4.688,  # xy loss gain
        'wh': 0.1857,  # wh loss gain
-       'cls': 27.76,  # cls loss gain  (CE=~1.0, uCE=~20, uBCE=~200,~30)
+       'cls': 27.76,  # cls loss gain
        'cls_pw': 1.446,  # cls BCELoss positive_weight
        'obj': 21.35,  # obj loss gain
        'obj_pw': 3.941,  # obj BCELoss positive_weight
@@ -52,27 +52,6 @@ hyp = {'giou': 1.582,  # giou loss gain
        'translate': 0.06797,  # image translation (+/- fraction)
        'scale': 0.1059,  # image scale (+/- gain)
        'shear': 0.5768}  # image shear (+/- deg)
-
-
-# # Hyperparameters (i-series)
-# hyp = {'giou': 1.43,  # giou loss gain
-#        'xy': 4.688,  # xy loss gain
-#        'wh': 0.1857,  # wh loss gain
-#        'cls': 11.7,  # cls loss gain
-#        'cls_pw': 4.81,  # cls BCELoss positive_weight
-#        'obj': 11.5,  # obj loss gain
-#        'obj_pw': 1.56,  # obj BCELoss positive_weight
-#        'iou_t': 0.281,  # iou training threshold
-#        'lr0': 0.0013,  # initial learning rate
-#        'lrf': -4.,  # final LambdaLR learning rate = lr0 * (10 ** lrf)
-#        'momentum': 0.944,  # SGD momentum
-#        'weight_decay': 0.000427,  # optimizer weight decay
-#        'hsv_s': 0.0599,  # image HSV-Saturation augmentation (fraction)
-#        'hsv_v': 0.142,  # image HSV-Value augmentation (fraction)
-#        'degrees': 1.03,  # image rotation (+/- deg)
-#        'translate': 0.0552,  # image translation (+/- fraction)
-#        'scale': 0.0555,  # image scale (+/- gain)
-#        'shear': 0.434}  # image shear (+/- deg)
 
 
 def train(cfg,
@@ -104,10 +83,9 @@ def train(cfg,
     model = Darknet(cfg).to(device)
 
     # Optimizer
-    # optimizer = optim.Adam(model.parameters(), lr=hyp['lr0'], weight_decay=hyp['weight_decay'])
-    # optimizer = AdaBound(model.parameters(), lr=hyp['lr0'], final_lr=0.1)
     optimizer = optim.SGD(model.parameters(), lr=hyp['lr0'], momentum=hyp['momentum'], weight_decay=hyp['weight_decay'],
                           nesterov=True)
+    # optimizer = AdaBound(model.parameters(), lr=hyp['lr0'], final_lr=0.1)
 
     cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
@@ -185,7 +163,7 @@ def train(cfg,
     dataset = LoadImagesAndLabels(train_path,
                                   img_size,
                                   batch_size,
-                                  augment=True,
+                                  augment=False,
                                   hyp=hyp,  # augmentation hyperparameters
                                   rect=opt.rect,  # rectangular training
                                   image_weights=opt.img_weights,
@@ -194,7 +172,7 @@ def train(cfg,
     # Dataloader
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
-                                             num_workers=min(os.cpu_count(), batch_size),
+                                             num_workers=opt.num_workers,
                                              shuffle=not opt.rect,  # Shuffle=True unless rectangular training is used
                                              pin_memory=True,
                                              collate_fn=dataset.collate_fn)
@@ -202,7 +180,8 @@ def train(cfg,
     # Start training
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
-    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device)  # attach class weights
+    if dataset.image_weights:
+        model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device)  # attach class weights
     model_info(model, report='summary')  # 'full' or 'summary'
     nb = len(dataloader)
     maps = np.zeros(nc)  # mAP per class
@@ -268,7 +247,7 @@ def train(cfg,
             pred = model(imgs)
 
             # Compute loss
-            loss, loss_items = compute_loss(pred, targets, model)
+            loss, loss_items = compute_loss(pred, targets, model, giou_loss=not opt.xywh)
             if torch.isnan(loss):
                 print('WARNING: nan loss detected, ending training')
                 return results
@@ -293,16 +272,10 @@ def train(cfg,
             pbar.set_description(s)
 
         # Calculate mAP (always test final epoch, skip first 5 if opt.nosave)
-        final_epoch = epoch + 1 == epochs
-        if not (opt.notest or (opt.nosave and epoch < 10)) or final_epoch:
+        if not (opt.notest or (opt.nosave and epoch < 10)) or epoch == epochs - 1:
             with torch.no_grad():
-                results, maps = test.test(cfg,
-                                          data,
-                                          batch_size=batch_size,
-                                          img_size=opt.img_size,
-                                          model=model,
-                                          conf_thres=0.001 if final_epoch else 0.1,  # 0.1 for speed
-                                          save_json=final_epoch and 'coco.data' in data)
+                results, maps = test.test(cfg, data, batch_size=batch_size, img_size=opt.img_size, model=model,
+                                          conf_thres=0.1)
 
         # Write epoch results
         with open('results.txt', 'a') as file:
@@ -322,7 +295,7 @@ def train(cfg,
             best_fitness = fitness
 
         # Save training results
-        save = (not opt.nosave) or ((not opt.evolve) and final_epoch)
+        save = (not opt.nosave) or ((not opt.evolve) and (epoch == epochs - 1))
         if save:
             with open('results.txt', 'r') as file:
                 # Create checkpoint
@@ -368,8 +341,10 @@ if __name__ == '__main__':
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', action='store_true', help='resume training flag')
     parser.add_argument('--transfer', action='store_true', help='transfer learning flag')
+    parser.add_argument('--num-workers', type=int, default=os.cpu_count(), help='DataLoader workers')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
+    parser.add_argument('--xywh', action='store_true', help='use xywh loss instead of GIoU loss')
     parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--img-weights', action='store_true', help='select training images by weight')
